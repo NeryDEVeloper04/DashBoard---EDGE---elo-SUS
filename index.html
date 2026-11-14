@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>elo SUS · Painel da UBS</title>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<style>
+  :root {
+    --bg:#f4f6f8; --card:#ffffff; --text:#14202b; --muted:#5b6b7a; --border:#dde3e9;
+    --ok:#1b9e5a; --warn:#d99a00; --crit:#d6342c; --err:#6b7280;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f151b; --card:#17202a; --text:#e8eef3; --muted:#93a3b2; --border:#26323e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 1.3rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: .9rem; margin-bottom: 16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:14px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+  input[type=text] { flex:1; min-width:220px; padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--bg); color:var(--text); }
+  button { padding:8px 14px; border:0; border-radius:8px; background:#2b6cb0; color:#fff; cursor:pointer; font-weight:600; }
+  .pill { display:inline-block; padding:3px 10px; border-radius:999px; font-size:.8rem; font-weight:600; background:var(--border); color:var(--muted); }
+  .pill.on { background:var(--ok); color:#fff; } .pill.off { background:var(--crit); color:#fff; }
+  .estado { font-size: 2.2rem; font-weight: 800; letter-spacing: .5px; }
+  .NORMAL { color: var(--ok); } .ATENCAO { color: var(--warn); } .CRITICO { color: var(--crit); } .ERRO { color: var(--err); }
+  .bar { height: 18px; background: var(--border); border-radius: 9px; overflow: hidden; margin-top: 10px; position: relative; }
+  .bar > div { height: 100%; width: 0; background: var(--ok); transition: width .4s, background .4s; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:12px; }
+  .kpi .v { font-size:1.6rem; font-weight:700; } .kpi .l { color:var(--muted); font-size:.8rem; }
+  #alerta { display:none; background:var(--crit); color:#fff; padding:14px 16px; border-radius:12px; font-weight:700; margin-bottom:14px; }
+  #semsinal { display:none; background:var(--err); color:#fff; padding:10px 14px; border-radius:12px; margin-bottom:14px; }
+  canvas { width:100%; height:180px; display:block; }
+  #log { font-family: ui-monospace, Menlo, Consolas, monospace; font-size:.78rem; color:var(--muted); max-height:140px; overflow:auto; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>elo SUS · Painel da UBS</h1>
+  <div class="sub">Camada 3 da arquitetura: recebe do broker MQTT o que o ESP32 publica.</div>
+
+  <div class="card">
+    <div class="row">
+      <input type="text" id="prefixo" value="fiap-gs2026/elosus/ubs01" aria-label="Prefixo do tópico">
+      <button id="btn">Conectar</button>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <span>Broker: <span class="pill" id="pBroker">desconectado</span></span>
+      <span>Totem: <span class="pill" id="pTotem">sem sinal</span></span>
+      <span class="sub" id="ultima" style="margin:0"></span>
+    </div>
+  </div>
+  
+
+  <div id="alerta">⚠ Lotação crítica: redirecione os pacientes para outra UBS.</div>
+  <div id="semsinal">Sem telemetria há mais de 10 s. O totem pode estar offline, mas continua alertando localmente.</div>
+
+  <div class="card">
+    <div class="sub">Estado atual</div>
+    <div class="estado ERRO" id="estado">—</div>
+    <div class="bar"><div id="barra"></div></div>
+    <div class="sub" style="margin-top:6px">Lotação: <b id="lot">—</b> (atenção ≥ 40% · crítico ≥ 75%)</div>
+  </div>
+
+  <div class="card grid">
+    <div class="kpi"><div class="v" id="dist">—</div><div class="l">Distância até a fila (cm)</div></div>
+    <div class="kpi"><div class="v" id="temp">—</div><div class="l">Temperatura da sala (°C)</div></div>
+    <div class="kpi"><div class="v" id="umid">—</div><div class="l">Umidade (%)</div></div>
+    <div class="kpi"><div class="v" id="falhas">—</div><div class="l">Falhas seguidas do sensor</div></div>
+  </div>
+
+  <div class="card">
+    <div class="sub">Lotação (últimas leituras)</div>
+    <canvas id="grafico"></canvas>
+  </div>
+
+  <div class="card"><div id="log">Aguardando conexão…</div></div>
+</main>
+
+<script>
+const BROKER_WS = "wss://broker.hivemq.com:8884/mqtt";
+const LIM_ATENCAO = 40, LIM_CRITICO = 75, SEM_SINAL_MS = 10000, MAX_PONTOS = 60;
+const $ = id => document.getElementById(id);
+const historico = [];
+let client = null, ultimaMsg = 0;
+
+function log(t) {
+  const el = $("log");
+  el.textContent = new Date().toLocaleTimeString() + "  " + t + "\n" + el.textContent.slice(0, 2000);
+}
+
+function corDoEstado(e) {
+  return e === "CRITICO" ? "var(--crit)" : e === "ATENCAO" ? "var(--warn)" : e === "NORMAL" ? "var(--ok)" : "var(--err)";
+}
+
+function mostrar(d) {
+  ultimaMsg = Date.now();
+  const e = ["NORMAL","ATENCAO","CRITICO","ERRO"].includes(d.estado) ? d.estado : "ERRO";
+  $("estado").textContent = e;
+  $("estado").className = "estado " + e;
+  const lot = Number(d.lotacao_pct) || 0;
+  $("lot").textContent = lot.toFixed(0) + "%";
+  $("barra").style.width = lot + "%";
+  $("barra").style.background = corDoEstado(e);
+  $("dist").textContent = d.dist_cm != null ? Number(d.dist_cm).toFixed(0) : "—";
+  $("temp").textContent = d.temp_c != null ? Number(d.temp_c).toFixed(1) : "—";
+  $("umid").textContent = d.umid_pct != null ? Number(d.umid_pct).toFixed(0) : "—";
+  $("falhas").textContent = d.falhas != null ? d.falhas : "—";
+  $("alerta").style.display = d.redirecionar === true ? "block" : "none";
+  $("ultima").textContent = "Última leitura: " + new Date().toLocaleTimeString();
+  historico.push({ lot, e });
+  if (historico.length > MAX_PONTOS) historico.shift();
+  desenhar();
+}
+
+function desenhar() {
+  const c = $("grafico"), dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  c.width = w * dpr; c.height = h * dpr;
+  const g = c.getContext("2d");
+  g.scale(dpr, dpr);
+  g.clearRect(0, 0, w, h);
+  const cs = getComputedStyle(document.documentElement);
+  const y = v => h - 8 - (v / 100) * (h - 16);
+  g.lineWidth = 1; g.setLineDash([4, 4]); g.font = "11px system-ui"; g.fillStyle = cs.getPropertyValue("--muted");
+  [[LIM_ATENCAO, "--warn"], [LIM_CRITICO, "--crit"]].forEach(([v, col]) => {
+    g.strokeStyle = cs.getPropertyValue(col);
+    g.beginPath(); g.moveTo(0, y(v)); g.lineTo(w, y(v)); g.stroke();
+    g.fillText(v + "%", 4, y(v) - 3);
+  });
+  g.setLineDash([]);
+  if (historico.length < 2) return;
+  g.lineWidth = 2.5; g.lineJoin = "round";
+  const dx = w / (MAX_PONTOS - 1);
+  for (let i = 1; i < historico.length; i++) {
+    g.strokeStyle = corDoEstado(historico[i].e).replace(/var\((.*)\)/, (m, n) => cs.getPropertyValue(n));
+    g.beginPath();
+    g.moveTo((i - 1) * dx, y(historico[i - 1].lot));
+    g.lineTo(i * dx, y(historico[i].lot));
+    g.stroke();
+  }
+}
+
+function setPill(el, texto, cls) { el.textContent = texto; el.className = "pill " + (cls || ""); }
+
+function conectar() {
+  if (client) { client.end(true); client = null; }
+  const pref = $("prefixo").value.trim().replace(/\/+$/, "");
+  if (!pref) { log("Informe o prefixo do tópico."); return; }
+  const tTel = pref + "/telemetria", tSt = pref + "/status";
+  setPill($("pBroker"), "conectando…", "");
+  client = mqtt.connect(BROKER_WS, { clientId: "elosus-dash-" + Math.random().toString(16).slice(2, 8), reconnectPeriod: 3000 });
+  client.on("connect", () => {
+    setPill($("pBroker"), "conectado", "on");
+    client.subscribe([tTel, tSt]);
+    log("Assinando " + tTel + " e " + tSt);
+  });
+  client.on("close", () => setPill($("pBroker"), "desconectado", "off"));
+  client.on("error", err => log("Erro MQTT: " + err.message));
+  client.on("message", (topic, payload) => {
+    const txt = payload.toString();
+    if (topic === tSt) {
+      setPill($("pTotem"), txt === "online" ? "online" : "offline", txt === "online" ? "on" : "off");
+      log("Status do totem: " + txt);
+      return;
+    }
+    try { mostrar(JSON.parse(txt)); }
+    catch (e) { log("Mensagem inválida ignorada."); }
+  });
+}
+
+setInterval(() => {
+  const sem = ultimaMsg && Date.now() - ultimaMsg > SEM_SINAL_MS;
+  $("semsinal").style.display = sem ? "block" : "none";
+}, 1000);
+
+$("btn").addEventListener("click", conectar);
+window.addEventListener("resize", desenhar);
+desenhar();
+</script>
+</body>
+</html>
